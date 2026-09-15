@@ -320,43 +320,20 @@ btnStart.addEventListener("click", async () => {
     progressLabel.textContent = "動画解析エンジンを準備しています…";
     await ensureMp4Box();
 
-    const segments = await splitVideo(currentFile, {
+    // 元動画の撮影日時（file.lastModified）。各パーツができ次第、その場で
+    // メタデータを書き換えてBlob化するため、先に計算しておく。
+    const fileLastModifiedDate = currentFile.lastModified ? new Date(currentFile.lastModified) : null;
+
+    const finalSegments = await splitVideo(currentFile, {
+      baseName,
+      fileLastModifiedDate,
       onPhase: (text) => { progressLabel.textContent = text; },
       onProgress: (ratio) => updateProgress(ratio),
     });
 
-    if (segments.length === 0) {
+    if (finalSegments.length === 0) {
       throw new Error("分割結果を読み取れませんでした。");
     }
-
-    // 元動画の撮影日時（file.lastModified）と、各パーツ自身の実際の長さを反映する
-    // （どちらも、全パーツで同じ初期化セグメントを使い回している影響を補正するため）
-    const fileLastModifiedDate = currentFile.lastModified ? new Date(currentFile.lastModified) : null;
-    {
-      for (const seg of segments) {
-        const segTime = fileLastModifiedDate
-          ? new Date(fileLastModifiedDate.getTime() + (seg.start + 1) * 1000)
-          : new Date();
-        try {
-          patchMp4Metadata(seg.arrayBuffer, segTime, seg.end - seg.start);
-        } catch (e) {
-          log(`メタデータの書き換えに失敗（${seg.index}番目）: ${e.message}`);
-        }
-      }
-    }
-
-    const finalSegments = segments.map((seg) => {
-      const blob = new Blob([seg.arrayBuffer], { type: "video/mp4" });
-      return {
-        index: seg.index,
-        start: seg.start,
-        end: seg.end,
-        url: URL.createObjectURL(blob),
-        blob,
-        filename: `${baseName}_${String(seg.index).padStart(2, "0")}.mp4`,
-        sizeBytes: seg.arrayBuffer.byteLength,
-      };
-    });
 
     renderResults(finalSegments);
     resultElapsedEl.textContent = `処理時間 ${formatDuration((Date.now() - elapsedStartMs) / 1000)}`;
@@ -383,7 +360,7 @@ btnStart.addEventListener("click", async () => {
    ファイルを少しずつ読み込みながら mp4box.js に渡し、映像・音声トラックを
    目標の長さ（約110秒。iPhoneのカメラで撮影した動画の平均的なフレームレートから、
    その秒数に相当するサンプル数を逆算して渡す）ごとにストリームコピーで切り出す。 */
-function splitVideo(file, { onPhase, onProgress }) {
+function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress }) {
   return new Promise((resolve, reject) => {
     const mp4boxfile = MP4Box.createFile();
     let videoTrackId = null;
@@ -423,16 +400,41 @@ function splitVideo(file, { onPhase, onProgress }) {
       const buffers = [initBuffer, parts.video];
       if (needAudio) buffers.push(parts.audio);
       const arrayBuffer = concatArrayBuffers(buffers);
+      // 使い終わった映像・音声の断片への参照をすぐ手放す（次のパーツの処理と
+      // 同時に、全パーツ分のバッファを溜め込んだままにしないため）
+      parts.video = null;
+      parts.audio = null;
+      pending.delete(segIndex);
+
       const plan = segmentPlan[segIndex];
+      const segIndex1 = segIndex + 1;
+
+      // 日付・長さの書き換えは、全パーツ分のバッファが出そろうのを待たず、
+      // このパーツができた時点ですぐに行う。書き換え後はBlob化して、生の
+      // ArrayBufferへの参照を残さない（Blobにした方がメモリ圧迫が少ない）。
+      const segTime = fileLastModifiedDate
+        ? new Date(fileLastModifiedDate.getTime() + (plan.startSec + 1) * 1000)
+        : new Date();
+      try {
+        patchMp4Metadata(arrayBuffer, segTime, plan.endSec - plan.startSec);
+      } catch (e) {
+        log(`メタデータの書き換えに失敗（${segIndex1}番目）: ${e.message}`);
+      }
+
+      const sizeBytes = arrayBuffer.byteLength;
+      const blob = new Blob([arrayBuffer], { type: "video/mp4" });
       finished.push({
-        index: segIndex + 1,
+        index: segIndex1,
         start: plan.startSec,
         end: plan.endSec,
-        arrayBuffer,
+        url: URL.createObjectURL(blob),
+        blob,
+        filename: `${baseName}_${String(segIndex1).padStart(2, "0")}.mp4`,
+        sizeBytes,
       });
-      pending.delete(segIndex);
-      onProgress((segIndex + 1) / segmentPlan.length);
-      onPhase(`切り出しています…（${segIndex + 1}/${segmentPlan.length}個目）`);
+
+      onProgress(segIndex1 / segmentPlan.length);
+      onPhase(`切り出しています…（${segIndex1}/${segmentPlan.length}個目）`);
       finishIfDone();
     }
 
