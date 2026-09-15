@@ -9,7 +9,7 @@
    ========================================================== */
 
 // 更新するたびに手動で書き換える（画面に表示され、更新が反映されたかの確認に使う）
-const APP_VERSION = "2026-09-15.2";
+const APP_VERSION = "2026-09-15.3";
 
 const TARGET_SEGMENT_SECONDS = 110; // 目安の区切り時間（実際の区切りはキーフレーム基準で多少前後する）
 const MIN_SEGMENT_SECONDS = 20; // これより短くはしない
@@ -302,6 +302,78 @@ function patchMp4Metadata(arrayBuffer, date, durationSeconds) {
   return arrayBuffer;
 }
 
+/* ---------- 断片（moof+mdat）のタイムスタンプを、このパーツの先頭=0秒に補正する ----------
+   mp4box.js が出力する moof 内の tfdt（baseMediaDecodeTime）は、元動画全体の中での
+   絶対位置のままになっている（パーツごとにリセットされない）。そのため、例えば
+   「元動画の7分00秒〜7分28秒」のパーツは、実際のデータは28秒分しかないのに、
+   コンテナ上は「0〜7分28秒の動画で、たまたま末尾28秒分だけデータがある」ように
+   見えてしまう。これが、日時のずれ・再生の途中停止・サムネイル生成失敗の原因になる。
+   このパーツに含まれる全moofのtfdtから、最初の値（＝このパーツの開始位置）を
+   引き、0始まりに補正する。映像・音声はタイムスケールが異なるため、それぞれの
+   バッファ（同一トラックのみを含む）ごとに個別に呼び出す。 */
+function rebaseFragmentTimestamps(buffer) {
+  const view = new DataView(buffer);
+  const end = buffer.byteLength;
+  const tfdtOffsets = [];
+
+  function readType(offset) {
+    return String.fromCharCode(
+      view.getUint8(offset + 4), view.getUint8(offset + 5),
+      view.getUint8(offset + 6), view.getUint8(offset + 7)
+    );
+  }
+
+  let offset = 0;
+  while (offset + 8 <= end) {
+    const size = view.getUint32(offset, false);
+    const type = readType(offset);
+    if (size < 8) break;
+    if (type === "moof") {
+      let coff = offset + 8;
+      const cend = offset + size;
+      while (coff + 8 <= cend) {
+        const csize = view.getUint32(coff, false);
+        const ctype = readType(coff);
+        if (csize < 8) break;
+        if (ctype === "traf") {
+          let toff = coff + 8;
+          const tend = coff + csize;
+          while (toff + 8 <= tend) {
+            const tsize = view.getUint32(toff, false);
+            const ttype = readType(toff);
+            if (ttype === "tfdt") tfdtOffsets.push(toff);
+            if (tsize < 8) break;
+            toff += tsize;
+          }
+        }
+        coff += csize;
+      }
+    }
+    offset += size;
+  }
+
+  if (tfdtOffsets.length === 0) return;
+
+  function readTfdt(off) {
+    const version = view.getUint8(off + 8);
+    return version === 1 ? view.getBigUint64(off + 12, false) : BigInt(view.getUint32(off + 12, false));
+  }
+  function writeTfdt(off, value) {
+    const version = view.getUint8(off + 8);
+    if (version === 1) view.setBigUint64(off + 12, value, false);
+    else view.setUint32(off + 12, Number(value), false);
+  }
+
+  let base = null;
+  for (const off of tfdtOffsets) {
+    const v = readTfdt(off);
+    if (base === null || v < base) base = v;
+  }
+  for (const off of tfdtOffsets) {
+    writeTfdt(off, readTfdt(off) - base);
+  }
+}
+
 /* ---------- ステップ2→3→4：分割開始 ---------- */
 btnStart.addEventListener("click", async () => {
   if (!currentFile) return;
@@ -396,6 +468,19 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
       const needAudio = audioTrackId !== null;
       if (!parts.video) return;
       if (needAudio && !parts.audio) return;
+
+      // mp4box.jsは各断片の tfdt（このパーツの先頭が元動画全体の中で何秒目に
+      // あたるか）を、パーツ単位でリセットせず元動画全体での絶対位置のまま
+      // 出力する。そのままだと、パーツ自身は数十秒しか実データが無いのに、
+      // コンテナ上は「元動画全体と同じ長さで、たまたま途中だけデータがある
+      // ファイル」に見えてしまい、日時のズレ・再生の途中停止・サムネイル
+      // 生成失敗の原因になる。このパーツの先頭を0秒とみなすよう補正する。
+      try {
+        rebaseFragmentTimestamps(parts.video);
+        if (parts.audio) rebaseFragmentTimestamps(parts.audio);
+      } catch (e) {
+        log(`タイムスタンプの補正に失敗（${segIndex + 1}番目）: ${e.message}`);
+      }
 
       const buffers = [initBuffer, parts.video];
       if (needAudio) buffers.push(parts.audio);
