@@ -9,7 +9,7 @@
    ========================================================== */
 
 // 更新するたびに手動で書き換える（画面に表示され、更新が反映されたかの確認に使う）
-const APP_VERSION = "2026-09-16.4";
+const APP_VERSION = "2026-09-16.5";
 
 const TARGET_SEGMENT_SECONDS = 110; // 目安の区切り時間（実際の区切りはキーフレーム基準で多少前後する）
 const MIN_SEGMENT_SECONDS = 20; // これより短くはしない
@@ -333,70 +333,181 @@ function patchMp4Metadata(arrayBuffer, date, durationSeconds) {
   return arrayBuffer;
 }
 
-/* ---------- 1パーツ分のサンプル列から、断片（moof+mdat）を自前で組み立てる ----------
-   mp4box.js 自身の断片化機能（setSegmentOptions/onSegment）は、内部的に必ず
-   「1コマ（1サンプル）＝1個のmoof+mdat」という単位で断片を作り、それを大量に
-   連結する仕組みになっている（60秒の動画で1000個以上）。これは仕様上は正しい
-   fMP4だが、実際に試したところiPhoneの写真アプリ側がこの特殊な構造とうまく
-   噛み合わず、動画の長さ表示や再生が壊れる問題が起きた。
+/* ---------- 1パーツ分のサンプル列から、古典的な（断片化しない）MP4を自前で組み立てる ----------
+   mp4box.js自身の断片化機能（setSegmentOptions/onSegment、あるいは自前でmoof+mdatを
+   組み立てる方式）は、仕様上は正しいfMP4を作れるが、iPhoneのカメラ動画は本来この
+   形式では保存されない。実際に試したところ、fMP4形式である限り、断片の粒度を
+   変えても（1コマ単位でも、1パーツ単位でも）、写真アプリ側の動画情報の長さ表示・
+   再生の挙動が直らなかった。
    そこで、mp4box.jsからは setExtractionOptions/onSamples で生のサンプル列
-   （実データ・長さ・タイムスタンプ情報）だけを受け取り、パーツ1個分のサンプルを
-   すべてまとめて「1個のmoof＋1個のmdat」として自前で書き出す。一般的な動画
-   ファイルに近い、まとまった大きさの断片になる。
-   箱の並び（tfhd/tfdt/trunの各フィールド）は、mp4box.js自身が1サンプルずつの
-   断片を作る際の書き出し方（createSingleSampleMoof）と同じ形式に合わせている。 */
-function buildMoofMdat(trackId, samples, sequenceNumber) {
-  const sampleCount = samples.length;
-  let mdatDataSize = 0;
-  for (const s of samples) mdatDataSize += s.size;
+   （実データ・長さ・タイムスタンプ情報）だけを受け取り、パーツ1個分を、
+   通常のカメラ動画と同じ「moovに直接サンプル位置の表（stbl）がある、
+   断片化しない」古典的なMP4として自前で組み立てる。
+   コーデック設定（stsd）やトラックの基本情報（tkhd/mdhd/hdlrなど）は、
+   元動画からそのままコピーする（extractTrackTemplates）。 */
 
-  const trunContentSize = 8 + 16 * sampleCount; // sample_count(4)+data_offset(4) + (duration+size+flags+cts)*4byte各
-  const trunBoxSize = 12 + trunContentSize; // FullBoxヘッダ(size4+type4+version1+flags3)
-  const tfhdBoxSize = 12 + 4; // track_idのみ
-  const tfdtBoxSize = 12 + 4; // version0のbaseMediaDecodeTime（常に0）
-  const trafBoxSize = 8 + tfhdBoxSize + tfdtBoxSize + trunBoxSize; // 単純なコンテナ箱（ヘッダ8byte）
-  const mfhdBoxSize = 12 + 4;
-  const moofBoxSize = 8 + mfhdBoxSize + trafBoxSize;
-  const mdatBoxSize = 8 + mdatDataSize;
-  const dataOffset = moofBoxSize + 8; // moof全体＋mdatヘッダの直後からサンプル実データが始まる
+// 元ファイルからftyp/moovの箱を（中身を読まずに）探す。ファイルを丸ごと
+// メモリへ読み込まず、箱のヘッダ（8〜16byte）だけを少しずつ読んで位置を
+// 特定する。moovが動画の末尾にあるカメラ動画でも、負荷は小さい。
+async function locateFtypAndMoov(file) {
+  let offset = 0;
+  const total = file.size;
+  let ftypLoc = null;
+  let moovLoc = null;
+  while (offset + 8 <= total && (!ftypLoc || !moovLoc)) {
+    const header = await file.slice(offset, offset + 8).arrayBuffer();
+    const view = new DataView(header);
+    let size = view.getUint32(0, false);
+    const type = String.fromCharCode(
+      view.getUint8(4), view.getUint8(5), view.getUint8(6), view.getUint8(7)
+    );
+    if (size === 1) {
+      const ext = await file.slice(offset + 8, offset + 16).arrayBuffer();
+      size = Number(new DataView(ext).getBigUint64(0, false));
+    } else if (size === 0) {
+      size = total - offset;
+    }
+    if (type === "ftyp") ftypLoc = { start: offset, size };
+    if (type === "moov") moovLoc = { start: offset, size };
+    if (size < 8) break;
+    offset += size;
+  }
+  if (!ftypLoc || !moovLoc) throw new Error("ftyp/moovの箱を認識できませんでした。");
+  return { ftypLoc, moovLoc };
+}
 
-  const out = new ArrayBuffer(moofBoxSize + mdatBoxSize);
+// 元動画のmoov（生バイト）から、トラックごとに「stbl以外」の部分（tkhd、
+// mdhd、hdlr、コーデック設定stsdなど）をテンプレートとして抜き出す。
+// stbl（サンプル位置の表）だけは、パーツごとに自前で作り直す必要がある。
+function extractTrackTemplates(moovBuf) {
+  const moov = findBox(moovBuf, 0, moovBuf.byteLength, "moov");
+  if (!moov) throw new Error("元動画のmoovを認識できませんでした。");
+  const mvhd = findBox(moovBuf, moov.offset + 8, moov.offset + moov.size, "mvhd");
+  if (!mvhd) throw new Error("mvhdを認識できませんでした。");
+  const mvhdBytes = moovBuf.slice(mvhd.offset, mvhd.offset + mvhd.size);
+  const view = new DataView(moovBuf);
+
+  const templates = [];
+  let trak = findBox(moovBuf, moov.offset + 8, moov.offset + moov.size, "trak");
+  while (trak) {
+    const tkhd = findBox(moovBuf, trak.offset + 8, trak.offset + trak.size, "tkhd");
+    const mdia = findBox(moovBuf, trak.offset + 8, trak.offset + trak.size, "mdia");
+    if (tkhd && mdia) {
+      const minf = findBox(moovBuf, mdia.offset + 8, mdia.offset + mdia.size, "minf");
+      const stbl = minf ? findBox(moovBuf, minf.offset + 8, minf.offset + minf.size, "stbl") : null;
+      const stsd = stbl ? findBox(moovBuf, stbl.offset + 8, stbl.offset + stbl.size, "stsd") : null;
+      if (minf && stbl && stsd) {
+        templates.push({
+          trackId: view.getUint32(tkhd.offset + 20, false),
+          preMdiaBytes: moovBuf.slice(trak.offset + 8, mdia.offset),
+          mdiaPreMinfBytes: moovBuf.slice(mdia.offset + 8, minf.offset),
+          minfPreStblBytes: moovBuf.slice(minf.offset + 8, stbl.offset),
+          stsdBytes: moovBuf.slice(stsd.offset, stsd.offset + stsd.size),
+        });
+      }
+    }
+    trak = findBox(moovBuf, trak.offset + trak.size, moov.offset + moov.size, "trak");
+  }
+  return { mvhdBytes, templates };
+}
+
+// 1トラック分のサンプル位置の表（stbl）を組み立てる。stco（サンプル実データの
+// ファイル内オフセット）はこの時点ではまだ分からないので0で仮置きし、
+// 呼び出し側でファイル全体の組み立てが終わってから書き換える（patchStco）。
+function buildStbl(stsdBytes, samples, isVideo) {
+  const sttsRuns = [];
+  for (const s of samples) {
+    if (sttsRuns.length && sttsRuns[sttsRuns.length - 1][1] === s.duration) sttsRuns[sttsRuns.length - 1][0]++;
+    else sttsRuns.push([1, s.duration]);
+  }
+  const needsCtts = samples.some((s) => s.cts !== s.dts);
+  const cttsRuns = [];
+  if (needsCtts) {
+    for (const s of samples) {
+      const off = s.cts - s.dts;
+      if (cttsRuns.length && cttsRuns[cttsRuns.length - 1][1] === off) cttsRuns[cttsRuns.length - 1][0]++;
+      else cttsRuns.push([1, off]);
+    }
+  }
+  const syncNumbers = [];
+  if (isVideo) samples.forEach((s, i) => { if (s.is_sync) syncNumbers.push(i + 1); });
+  const needsStss = isVideo && syncNumbers.length > 0 && syncNumbers.length < samples.length;
+
+  const sttsSize = 16 + sttsRuns.length * 8;
+  const cttsSize = needsCtts ? (16 + cttsRuns.length * 8) : 0;
+  const stssSize = needsStss ? (16 + syncNumbers.length * 4) : 0;
+  const stscSize = 12 + 4 + 12;
+  const stszSize = 12 + 8 + samples.length * 4;
+  const stcoSize = 12 + 4 + 4;
+  const stblContentSize = stsdBytes.byteLength + sttsSize + cttsSize + stscSize + stszSize + stssSize + stcoSize;
+  const stblSize = 8 + stblContentSize;
+
+  const out = new ArrayBuffer(stblSize);
   const view = new DataView(out);
   const bytes = new Uint8Array(out);
   let pos = 0;
-
-  function u8(v) { view.setUint8(pos, v); pos += 1; }
   function u32(v) { view.setUint32(pos, v, false); pos += 4; }
-  function i32(v) { view.setInt32(pos, v, false); pos += 4; }
-  function boxType(t) { for (let i = 0; i < 4; i++) u8(t.charCodeAt(i)); }
+  function boxType(t) { for (let i = 0; i < 4; i++) { view.setUint8(pos, t.charCodeAt(i)); pos += 1; } }
   function plainHeader(size, type) { u32(size); boxType(type); }
-  function fullHeader(size, type, flags) { u32(size); boxType(type); u8(0); u8((flags >> 16) & 0xff); u8((flags >> 8) & 0xff); u8(flags & 0xff); }
+  function fullHeader(size, type) { u32(size); boxType(type); u32(0); } // version(1)+flags(3)=0
 
-  plainHeader(moofBoxSize, "moof");
-  fullHeader(mfhdBoxSize, "mfhd", 0);
-  u32(sequenceNumber);
-  plainHeader(trafBoxSize, "traf");
-  fullHeader(tfhdBoxSize, "tfhd", 0x020000); // default-base-is-moof
-  u32(trackId);
-  fullHeader(tfdtBoxSize, "tfdt", 0);
-  u32(0); // このパーツの先頭を0秒とする
-  fullHeader(trunBoxSize, "trun", 0x01 | 0x100 | 0x200 | 0x400 | 0x800); // data-offset+duration+size+flags+cts-offset
-  u32(sampleCount);
-  i32(dataOffset);
-  for (const s of samples) {
-    u32(s.duration);
-    u32(s.size);
-    u32(s.is_sync ? (1 << 25) : (1 << 16));
-    u32(s.cts - s.dts);
+  plainHeader(stblSize, "stbl");
+  bytes.set(new Uint8Array(stsdBytes), pos);
+  pos += stsdBytes.byteLength;
+
+  fullHeader(sttsSize, "stts");
+  u32(sttsRuns.length);
+  for (const [count, delta] of sttsRuns) { u32(count); u32(delta); }
+
+  if (needsCtts) {
+    fullHeader(cttsSize, "ctts");
+    u32(cttsRuns.length);
+    for (const [count, off] of cttsRuns) { u32(count); u32(off); }
   }
 
-  plainHeader(mdatBoxSize, "mdat");
-  for (const s of samples) {
-    bytes.set(s.data, pos);
-    pos += s.size;
+  fullHeader(stscSize, "stsc");
+  u32(1);
+  u32(1); u32(samples.length); u32(1); // first_chunk, samples_per_chunk, sample_description_index
+
+  fullHeader(stszSize, "stsz");
+  u32(0); // sample_size=0 → 以降は1個ずつのサイズ表
+  u32(samples.length);
+  for (const s of samples) u32(s.size);
+
+  if (needsStss) {
+    fullHeader(stssSize, "stss");
+    u32(syncNumbers.length);
+    for (const n of syncNumbers) u32(n);
   }
+
+  fullHeader(stcoSize, "stco");
+  u32(1);
+  u32(0); // 実際のオフセットは後で書き換える
 
   return out;
+}
+
+// テンプレート（stbl以外）＋このパーツのサンプル列から、1トラック分のtrak箱を
+// 組み立てる。内側（stbl）から外側（trak）へ、サイズを積み上げながら組み立てる。
+function buildTrak(template, samples, isVideo) {
+  const stbl = buildStbl(template.stsdBytes, samples, isVideo);
+  const minfContent = concatArrayBuffers([template.minfPreStblBytes, stbl]);
+  const minfBytes = concatArrayBuffers([boxHeader(8 + minfContent.byteLength, "minf"), minfContent]);
+  const mdiaContent = concatArrayBuffers([template.mdiaPreMinfBytes, minfBytes]);
+  const mdiaBytes = concatArrayBuffers([boxHeader(8 + mdiaContent.byteLength, "mdia"), mdiaContent]);
+  const trakContent = concatArrayBuffers([template.preMdiaBytes, mdiaBytes]);
+  return concatArrayBuffers([boxHeader(8 + trakContent.byteLength, "trak"), trakContent]);
+}
+
+// buildTrak()が返したtrak箱の中のstco（サンプル実データの絶対オフセット）を、
+// ファイル全体の組み立てが終わって初めて分かる実際の値に書き換える。
+function patchStco(trakBuffer, dataOffset) {
+  const trak = findBox(trakBuffer, 0, trakBuffer.byteLength, "trak");
+  const mdia = findBox(trakBuffer, trak.offset + 8, trak.offset + trak.size, "mdia");
+  const minf = findBox(trakBuffer, mdia.offset + 8, mdia.offset + mdia.size, "minf");
+  const stbl = findBox(trakBuffer, minf.offset + 8, minf.offset + minf.size, "stbl");
+  const stco = findBox(trakBuffer, stbl.offset + 8, stbl.offset + stbl.size, "stco");
+  new DataView(trakBuffer).setUint32(stco.offset + 16, dataOffset, false); // header(12)+entry_count(4)
 }
 
 /* ---------- ステップ2→3→4：分割開始 ---------- */
@@ -456,16 +567,20 @@ btnStart.addEventListener("click", async () => {
 /* ---------- 分割の中心処理（mp4box.js） ----------
    ファイルを少しずつ読み込みながら mp4box.js に渡し、映像・音声トラックを
    目標の長さ（約110秒。iPhoneのカメラで撮影した動画の平均的なフレームレートから、
-   その秒数に相当するサンプル数を逆算して渡す）ごとにストリームコピーで切り出す。 */
+   その秒数に相当するサンプル数を逆算して渡す）ごとにストリームコピーで切り出す。
+   各パーツは、断片化（fMP4）ではなく、通常のカメラ動画と同じ古典的な構造
+   （moovに直接サンプル位置の表がある）で組み立てる。 */
 function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress }) {
   return new Promise((resolve, reject) => {
     const mp4boxfile = MP4Box.createFile();
     let videoTrackId = null;
     let audioTrackId = null;
-    let initBuffer = null;
+    let templateFtypBytes = null;
+    let templateMvhdBytes = null;
+    let trackTemplates = null; // [{trackId, preMdiaBytes, mdiaPreMinfBytes, minfPreStblBytes, stsdBytes}, ...]
     let totalDuration = 0;
-    let segmentPlan = []; // [{index, startSample, endSample, startSec, endSec}, ...]（映像基準）
-    const pending = new Map(); // segmentIndex -> { video: buffer|null, audio: buffer|null }
+    let segmentPlan = []; // [{startSec, endSec}, ...]（映像基準）
+    const pending = new Map(); // segmentIndex -> { video: samples|null, audio: samples|null }
     const finished = [];
     let readerDone = false;
     let settled = false;
@@ -494,21 +609,53 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
       if (!parts.video) return;
       if (needAudio && !parts.audio) return;
 
-      const buffers = [initBuffer, parts.video];
-      if (needAudio) buffers.push(parts.audio);
-      const arrayBuffer = concatArrayBuffers(buffers);
-      // 使い終わった映像・音声の断片への参照をすぐ手放す（次のパーツの処理と
-      // 同時に、全パーツ分のバッファを溜め込んだままにしないため）
+      const videoSamples = parts.video;
+      const audioSamples = parts.audio;
+      // 使い終わった映像・音声のサンプル列への参照をすぐ手放す（次のパーツの
+      // 処理と同時に、全パーツ分を溜め込んだままにしないため）
       parts.video = null;
       parts.audio = null;
       pending.delete(segIndex);
 
+      const videoTemplate = trackTemplates.find((t) => t.trackId === videoTrackId);
+      const audioTemplate = needAudio ? trackTemplates.find((t) => t.trackId === audioTrackId) : null;
+
+      const videoTrakBuffer = buildTrak(videoTemplate, videoSamples, true);
+      const audioTrakBuffer = needAudio ? buildTrak(audioTemplate, audioSamples, false) : null;
+
+      // moov全体の大きさは、trak（サイズ固定・stcoの値だけこの後書き換える）が
+      // 組み上がった時点で確定する。stcoに入れるべき絶対オフセットは、
+      // 「ftyp＋moov＋mdatヘッダ」の直後から始まる。
+      const headerLen = templateFtypBytes.byteLength + 8 + templateMvhdBytes.byteLength
+        + videoTrakBuffer.byteLength + (audioTrakBuffer ? audioTrakBuffer.byteLength : 0);
+
+      let videoDataSize = 0;
+      for (const s of videoSamples) videoDataSize += s.size;
+      let audioDataSize = 0;
+      if (audioSamples) for (const s of audioSamples) audioDataSize += s.size;
+
+      const videoDataOffset = headerLen + 8; // mdatヘッダの直後
+      const audioDataOffset = videoDataOffset + videoDataSize;
+      patchStco(videoTrakBuffer, videoDataOffset);
+      if (audioTrakBuffer) patchStco(audioTrakBuffer, audioDataOffset);
+
+      const moovContentParts = [templateMvhdBytes, videoTrakBuffer];
+      if (audioTrakBuffer) moovContentParts.push(audioTrakBuffer);
+      const moovContent = concatArrayBuffers(moovContentParts);
+      const moovBytes = concatArrayBuffers([boxHeader(8 + moovContent.byteLength, "moov"), moovContent]);
+      const mdatHeader = boxHeader(8 + videoDataSize + audioDataSize, "mdat");
+
+      const fileParts = [templateFtypBytes, moovBytes, mdatHeader];
+      for (const s of videoSamples) fileParts.push(s.data);
+      if (audioSamples) for (const s of audioSamples) fileParts.push(s.data);
+      const arrayBuffer = concatArrayBuffers(fileParts);
+
       const plan = segmentPlan[segIndex];
       const segIndex1 = segIndex + 1;
 
-      // 日付・長さの書き換えは、全パーツ分のバッファが出そろうのを待たず、
-      // このパーツができた時点ですぐに行う。書き換え後はBlob化して、生の
-      // ArrayBufferへの参照を残さない（Blobにした方がメモリ圧迫が少ない）。
+      // 日付・長さの書き換えは、このパーツができた時点ですぐに行う。書き換え後は
+      // Blob化して、生のArrayBufferへの参照を残さない（Blobにした方がメモリ
+      // 圧迫が少ない）。
       const segTime = fileLastModifiedDate
         ? new Date(fileLastModifiedDate.getTime() + (plan.startSec + 1) * 1000)
         : new Date();
@@ -573,41 +720,11 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
 
         log(`duration=${totalDuration.toFixed(1)}s videoFps=${videoFps.toFixed(2)} nbSamplesPerSeg=${nbSamplesPerSeg} segCount=${segCount}`);
 
-        // setSegmentOptions()自体はダミー値でよい（onSegmentは使わないため）。
-        // initializeSegmentation()が初期化セグメント（moov）を返すために、
-        // 各トラックが「登録済み」である必要があるだけ。
-        mp4boxfile.setSegmentOptions(videoTrackId, "video", {});
-        let audioNbSamples = 0;
-        if (audioTrackId) {
-          const audioTrack = info.tracks.find((t) => t.id === audioTrackId);
-          const audioRate = audioTrack.nb_samples / totalDuration;
-          audioNbSamples = Math.max(1, Math.round(audioRate * effectiveSeconds));
-          mp4boxfile.setSegmentOptions(audioTrackId, "audio", {});
-        }
-
-        // initializeSegmentation() はトラックごとに別々の初期化セグメント（moov）を返す
-        // （"combined"モードでも共有されない）。音声がある場合は、映像側のmoovに
-        // 音声のtrak/trexを直接埋め込んで、1つのmoovにまとめる必要がある。
-        const initSegs = mp4boxfile.initializeSegmentation();
-        const videoInitEntry = initSegs.find((s) => s.id === videoTrackId);
-        const audioInitEntry = audioTrackId ? initSegs.find((s) => s.id === audioTrackId) : null;
-        initBuffer = audioInitEntry
-          ? buildCombinedInitSegment(videoInitEntry.buffer, audioInitEntry.buffer)
-          : videoInitEntry.buffer;
-        try {
-          initBuffer = stripTrakMeta(initBuffer);
-        } catch (e) {
-          log(`trakメタデータの除去に失敗: ${e.message}`);
-        }
-
-        // mp4boxfile.onSegmentは設定しない（デフォルトのnull）ため、mp4box.js内部の
-        // 「1コマ＝1断片」というセグメント化処理は一切動かない。代わりに
-        // setExtractionOptions/onSamplesで生のサンプル列を取得し、パーツ1個分を
-        // まとめて1つの断片（moof+mdat）として自前で組み立てる（buildMoofMdat）。
-        // 通常の動画ファイルに近い、まとまった大きさの断片になり、iPhone側との
-        // 相性問題を避けられる。
         mp4boxfile.setExtractionOptions(videoTrackId, "video", { nbSamples: nbSamplesPerSeg });
         if (audioTrackId) {
+          const audioTrack2 = info.tracks.find((t) => t.id === audioTrackId);
+          const audioRate = audioTrack2.nb_samples / totalDuration;
+          const audioNbSamples = Math.max(1, Math.round(audioRate * effectiveSeconds));
           mp4boxfile.setExtractionOptions(audioTrackId, "audio", { nbSamples: audioNbSamples });
         }
 
@@ -622,25 +739,38 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
     let segCounterAudio = 0;
     let sampleCounterVideo = 0;
     let sampleCounterAudio = 0;
-    let moofSequence = 1;
 
     mp4boxfile.onSamples = (id, user, samples) => {
       const isVideo = id === videoTrackId;
       const idx = isVideo ? segCounterVideo++ : segCounterAudio++;
+      // mp4box.jsは releaseUsedSamples() を呼ぶと、内部で保持している
+      // sample.data を null にしてしまう。パーツが完成する（emitIfReady）まで
+      // このサンプルのデータが必要なので、ここで独立したコピーとして持っておく。
+      const copied = samples.map((s) => ({
+        data: new Uint8Array(s.data), size: s.size, duration: s.duration, cts: s.cts, dts: s.dts, is_sync: s.is_sync,
+      }));
       if (isVideo) sampleCounterVideo += samples.length; else sampleCounterAudio += samples.length;
       if (idx < segmentPlan.length) {
         if (!pending.has(idx)) pending.set(idx, { video: null, audio: audioTrackId ? null : undefined });
         const parts = pending.get(idx);
-        const buffer = buildMoofMdat(id, samples, moofSequence++);
-        if (isVideo) parts.video = buffer; else parts.audio = buffer;
+        if (isVideo) parts.video = copied; else parts.audio = copied;
         emitIfReady(idx);
       } // 想定外の余剰バッチは無視
       mp4boxfile.releaseUsedSamples(id, isVideo ? sampleCounterVideo : sampleCounterAudio);
     };
 
-    // ファイルを少しずつ読み込んで渡す
     (async () => {
       try {
+        // トラックの基本情報（tkhd/mdhd/hdlr/コーデック設定など）のテンプレートを、
+        // 元ファイルから直接（mp4box.jsを介さず）取得しておく。
+        const { ftypLoc, moovLoc } = await locateFtypAndMoov(file);
+        templateFtypBytes = await file.slice(ftypLoc.start, ftypLoc.start + ftypLoc.size).arrayBuffer();
+        const moovBuf = await file.slice(moovLoc.start, moovLoc.start + moovLoc.size).arrayBuffer();
+        const extracted = extractTrackTemplates(moovBuf);
+        templateMvhdBytes = extracted.mvhdBytes;
+        trackTemplates = extracted.templates;
+
+        // ファイルを少しずつ読み込んで渡す
         let offset = 0;
         const total = file.size;
         while (offset < total) {
@@ -676,11 +806,7 @@ function concatArrayBuffers(buffers) {
   return result.buffer;
 }
 
-/* ---------- 映像・音声の初期化セグメント（moov）を1つに結合する ----------
-   mp4box.js の initializeSegmentation() は、映像・音声それぞれに独立した
-   moovを返す。映像側のmoovに、音声側の trak（トラック構造）と trex
-   （mvex内のフラグメント既定値）を挿入し、1つのファイルとして両方の
-   トラックを正しく記述するmoovを組み立てる。 */
+/* ---------- MP4の箱（box）を読み書きするための共通ヘルパー ---------- */
 function findBox(buf, start, end, type) {
   const view = new DataView(buf);
   let offset = start;
@@ -703,80 +829,6 @@ function boxHeader(size, type) {
   dv.setUint32(0, size, false);
   for (let i = 0; i < 4; i++) dv.setUint8(4 + i, type.charCodeAt(i));
   return b;
-}
-
-function buildCombinedInitSegment(videoBuf, audioBuf) {
-  const vFtyp = findBox(videoBuf, 0, videoBuf.byteLength, "ftyp");
-  const vMoov = findBox(videoBuf, 0, videoBuf.byteLength, "moov");
-  const aMoov = findBox(audioBuf, 0, audioBuf.byteLength, "moov");
-  if (!vFtyp || !vMoov || !aMoov) throw new Error("初期化セグメントの箱を認識できませんでした。");
-
-  const aTrak = findBox(audioBuf, aMoov.offset + 8, aMoov.offset + aMoov.size, "trak");
-  const aMvex = findBox(audioBuf, aMoov.offset + 8, aMoov.offset + aMoov.size, "mvex");
-  const aTrex = aMvex ? findBox(audioBuf, aMvex.offset + 8, aMvex.offset + aMvex.size, "trex") : null;
-  if (!aTrak) throw new Error("音声トラックの構造（trak）を認識できませんでした。");
-
-  const vMvex = findBox(videoBuf, vMoov.offset + 8, vMoov.offset + vMoov.size, "mvex");
-  const aTrakBytes = audioBuf.slice(aTrak.offset, aTrak.offset + aTrak.size);
-  const aTrexBytes = aTrex ? audioBuf.slice(aTrex.offset, aTrex.offset + aTrex.size) : new ArrayBuffer(0);
-
-  let newMoovContentParts;
-  if (vMvex) {
-    const beforeMvex = videoBuf.slice(vMoov.offset + 8, vMvex.offset);
-    const mvexContent = videoBuf.slice(vMvex.offset + 8, vMvex.offset + vMvex.size);
-    const newMvexSize = 8 + mvexContent.byteLength + aTrexBytes.byteLength;
-    const afterMvex = videoBuf.slice(vMvex.offset + vMvex.size, vMoov.offset + vMoov.size);
-    newMoovContentParts = [beforeMvex, boxHeader(newMvexSize, "mvex"), mvexContent, aTrexBytes, afterMvex, aTrakBytes];
-  } else {
-    const wholeMoovContent = videoBuf.slice(vMoov.offset + 8, vMoov.offset + vMoov.size);
-    newMoovContentParts = [wholeMoovContent, aTrakBytes];
-  }
-
-  const newMoovContent = concatArrayBuffers(newMoovContentParts);
-  const newMoovSize = 8 + newMoovContent.byteLength;
-  const ftypBytes = videoBuf.slice(vFtyp.offset, vFtyp.offset + vFtyp.size);
-  return concatArrayBuffers([ftypBytes, boxHeader(newMoovSize, "moov"), newMoovContent]);
-}
-
-/* ---------- 各trakのmeta（レンズ情報・Appleのメーカーノートなど）を取り除く ----------
-   元動画の撮影時に埋め込まれたカメラメタデータ（trak/metaの中のkeys/ilst）が、
-   全パーツで書き換えずそのままコピーされている。再生や長さの表示には本来
-   関係ないはずの情報だが、tfdt・elst・moof構造をすべて正しく修正した後も
-   iPhone側の動画情報の長さ表示だけがなぜか直らない状況が続いたため、Appleの
-   独自メーカーノート（写真アプリ側だけが解釈できる可能性がある不透明な
-   データ）が元動画との紐付け・表示に影響している可能性を疑い、念のため
-   取り除く。再生に必須の情報ではないため、消しても支障はない。 */
-function stripTrakMeta(buf) {
-  let current = buf;
-  for (let guard = 0; guard < 4; guard++) {
-    const moov = findBox(current, 0, current.byteLength, "moov");
-    if (!moov) break;
-    let trak = findBox(current, moov.offset + 8, moov.offset + moov.size, "trak");
-    let removedThisPass = false;
-    while (trak) {
-      const meta = findBox(current, trak.offset + 8, trak.offset + trak.size, "meta");
-      if (meta) {
-        const newTrakSize = trak.size - meta.size;
-        const newTrakContent = concatArrayBuffers([
-          current.slice(trak.offset + 8, meta.offset),
-          current.slice(meta.offset + meta.size, trak.offset + trak.size),
-        ]);
-        const newTrakBytes = concatArrayBuffers([boxHeader(newTrakSize, "trak"), newTrakContent]);
-        const newMoovContent = concatArrayBuffers([
-          current.slice(moov.offset + 8, trak.offset),
-          newTrakBytes,
-          current.slice(trak.offset + trak.size, moov.offset + moov.size),
-        ]);
-        const newMoovBytes = concatArrayBuffers([boxHeader(moov.size - meta.size, "moov"), newMoovContent]);
-        current = concatArrayBuffers([current.slice(0, moov.offset), newMoovBytes, current.slice(moov.offset + moov.size)]);
-        removedThisPass = true;
-        break; // オフセットがずれるので、この moov はやり直す
-      }
-      trak = findBox(current, trak.offset + trak.size, moov.offset + moov.size, "trak");
-    }
-    if (!removedThisPass) break;
-  }
-  return current;
 }
 
 /* ---------- 保存する（共有シート経由。使えない環境ではダウンロードにフォールバック） ---------- */
