@@ -9,7 +9,7 @@
    ========================================================== */
 
 // 更新するたびに手動で書き換える（画面に表示され、更新が反映されたかの確認に使う）
-const APP_VERSION = "2026-09-16.2";
+const APP_VERSION = "2026-09-16.3";
 
 const TARGET_SEGMENT_SECONDS = 110; // 目安の区切り時間（実際の区切りはキーフレーム基準で多少前後する）
 const MIN_SEGMENT_SECONDS = 20; // これより短くはしない
@@ -588,6 +588,11 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
         initBuffer = audioInitEntry
           ? buildCombinedInitSegment(videoInitEntry.buffer, audioInitEntry.buffer)
           : videoInitEntry.buffer;
+        try {
+          initBuffer = stripTrakMeta(initBuffer);
+        } catch (e) {
+          log(`trakメタデータの除去に失敗: ${e.message}`);
+        }
 
         // mp4boxfile.onSegmentは設定しない（デフォルトのnull）ため、mp4box.js内部の
         // 「1コマ＝1断片」というセグメント化処理は一切動かない。代わりに
@@ -725,6 +730,47 @@ function buildCombinedInitSegment(videoBuf, audioBuf) {
   const newMoovSize = 8 + newMoovContent.byteLength;
   const ftypBytes = videoBuf.slice(vFtyp.offset, vFtyp.offset + vFtyp.size);
   return concatArrayBuffers([ftypBytes, boxHeader(newMoovSize, "moov"), newMoovContent]);
+}
+
+/* ---------- 各trakのmeta（レンズ情報・Appleのメーカーノートなど）を取り除く ----------
+   元動画の撮影時に埋め込まれたカメラメタデータ（trak/metaの中のkeys/ilst）が、
+   全パーツで書き換えずそのままコピーされている。再生や長さの表示には本来
+   関係ないはずの情報だが、tfdt・elst・moof構造をすべて正しく修正した後も
+   iPhone側の動画情報の長さ表示だけがなぜか直らない状況が続いたため、Appleの
+   独自メーカーノート（写真アプリ側だけが解釈できる可能性がある不透明な
+   データ）が元動画との紐付け・表示に影響している可能性を疑い、念のため
+   取り除く。再生に必須の情報ではないため、消しても支障はない。 */
+function stripTrakMeta(buf) {
+  let current = buf;
+  for (let guard = 0; guard < 4; guard++) {
+    const moov = findBox(current, 0, current.byteLength, "moov");
+    if (!moov) break;
+    let trak = findBox(current, moov.offset + 8, moov.offset + moov.size, "trak");
+    let removedThisPass = false;
+    while (trak) {
+      const meta = findBox(current, trak.offset + 8, trak.offset + trak.size, "meta");
+      if (meta) {
+        const newTrakSize = trak.size - meta.size;
+        const newTrakContent = concatArrayBuffers([
+          current.slice(trak.offset + 8, meta.offset),
+          current.slice(meta.offset + meta.size, trak.offset + trak.size),
+        ]);
+        const newTrakBytes = concatArrayBuffers([boxHeader(newTrakSize, "trak"), newTrakContent]);
+        const newMoovContent = concatArrayBuffers([
+          current.slice(moov.offset + 8, trak.offset),
+          newTrakBytes,
+          current.slice(trak.offset + trak.size, moov.offset + moov.size),
+        ]);
+        const newMoovBytes = concatArrayBuffers([boxHeader(moov.size - meta.size, "moov"), newMoovContent]);
+        current = concatArrayBuffers([current.slice(0, moov.offset), newMoovBytes, current.slice(moov.offset + moov.size)]);
+        removedThisPass = true;
+        break; // オフセットがずれるので、この moov はやり直す
+      }
+      trak = findBox(current, trak.offset + trak.size, moov.offset + moov.size, "trak");
+    }
+    if (!removedThisPass) break;
+  }
+  return current;
 }
 
 /* ---------- 保存する（共有シート経由。使えない環境ではダウンロードにフォールバック） ---------- */
