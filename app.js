@@ -9,7 +9,7 @@
    ========================================================== */
 
 // 更新するたびに手動で書き換える（画面に表示され、更新が反映されたかの確認に使う）
-const APP_VERSION = "2026-09-15.3";
+const APP_VERSION = "2026-09-16.1";
 
 const TARGET_SEGMENT_SECONDS = 110; // 目安の区切り時間（実際の区切りはキーフレーム基準で多少前後する）
 const MIN_SEGMENT_SECONDS = 20; // これより短くはしない
@@ -290,7 +290,20 @@ function patchMp4Metadata(arrayBuffer, date, durationSeconds) {
             view.setUint32(offset + 28, Math.round(durationSeconds * movieTimescale), false);
           }
         }
-      } else if (type === "moov" || type === "trak" || type === "mdia") {
+      } else if (type === "elst") {
+        // 編集リスト（トラックが「ムービー全体の中で何秒間再生されるか」を
+        // 宣言する箱）。ここが元動画全体の長さのまま残っていると、mvhd/tkhd
+        // を書き換えてもiPhone側はこちらを信用してしまい、動画情報の長さが
+        // 元動画のまま表示されたり、実データが尽きた後もスクラバーだけ動き
+        // 続けたり、音声が正しく再生されなくなったりする。
+        const version = view.getUint8(offset + 8);
+        const entryCount = view.getUint32(offset + 12, false);
+        if (version === 0 && entryCount === 1 && movieTimescale) {
+          view.setUint32(offset + 16, Math.round(durationSeconds * movieTimescale), false); // segment_duration
+        } else {
+          log(`elstの補正をスキップ（version=${version}, entryCount=${entryCount}）`);
+        }
+      } else if (type === "moov" || type === "trak" || type === "mdia" || type === "edts") {
         walk(offset + 8, boxEnd);
       }
 
