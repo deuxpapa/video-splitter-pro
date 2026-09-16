@@ -9,7 +9,7 @@
    ========================================================== */
 
 // 更新するたびに手動で書き換える（画面に表示され、更新が反映されたかの確認に使う）
-const APP_VERSION = "2026-09-16.3";
+const APP_VERSION = "2026-09-16.4";
 
 const TARGET_SEGMENT_SECONDS = 110; // 目安の区切り時間（実際の区切りはキーフレーム基準で多少前後する）
 const MIN_SEGMENT_SECONDS = 20; // これより短くはしない
@@ -154,10 +154,15 @@ function formatDuration(totalSec) {
 }
 
 /* ---------- ステップ1→2：ファイル選択 ---------- */
+// 動画を選ぶピッカーを開く操作自体（大きい動画だと選択～読み込みに時間が
+// かかることがある）の時点で、画面が暗くならないようにしておく。
+fileInput.addEventListener("click", () => { requestWakeLock(); });
+
 fileInput.addEventListener("change", () => {
   const file = fileInput.files && fileInput.files[0];
   if (!file) return;
   currentFile = file;
+  requestWakeLock();
 
   readyFilename.textContent = file.name;
   readyMeta.textContent = `${formatBytes(file.size)}・動画の長さは分割開始時に確認します`;
@@ -182,6 +187,7 @@ function resetToSelect() {
   fileInput.value = "";
   clearErrorDetail();
   showScreen("select");
+  releaseWakeLock();
 }
 
 /* ---------- 外部スクリプトの読み込み（動画解析エンジン本体） ---------- */
