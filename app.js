@@ -9,7 +9,7 @@
    ========================================================== */
 
 // 更新するたびに手動で書き換える（画面に表示され、更新が反映されたかの確認に使う）
-const APP_VERSION = "2026-09-16.1";
+const APP_VERSION = "2026-09-16.2";
 
 const TARGET_SEGMENT_SECONDS = 110; // 目安の区切り時間（実際の区切りはキーフレーム基準で多少前後する）
 const MIN_SEGMENT_SECONDS = 20; // これより短くはしない
@@ -298,10 +298,22 @@ function patchMp4Metadata(arrayBuffer, date, durationSeconds) {
         // 続けたり、音声が正しく再生されなくなったりする。
         const version = view.getUint8(offset + 8);
         const entryCount = view.getUint32(offset + 12, false);
-        if (version === 0 && entryCount === 1 && movieTimescale) {
-          view.setUint32(offset + 16, Math.round(durationSeconds * movieTimescale), false); // segment_duration
-        } else {
-          log(`elstの補正をスキップ（version=${version}, entryCount=${entryCount}）`);
+        if (version === 0 && movieTimescale) {
+          // media_time === -1 の entry は「空の間（dwell）」で、A/V同期用の
+          // 固定オフセットなので触らない。実データを指すentry（通常1つ）だけを
+          // このパーツの長さに書き換える。
+          const realEntryOffsets = [];
+          let entryOffset = offset + 16;
+          for (let i = 0; i < entryCount; i++) {
+            const mediaTime = view.getInt32(entryOffset + 4, false);
+            if (mediaTime !== -1) realEntryOffsets.push(entryOffset);
+            entryOffset += 12;
+          }
+          if (realEntryOffsets.length === 1) {
+            view.setUint32(realEntryOffsets[0], Math.round(durationSeconds * movieTimescale), false); // segment_duration
+          } else {
+            log(`elstの補正をスキップ（entryCount=${entryCount}, 実データentry数=${realEntryOffsets.length}）`);
+          }
         }
       } else if (type === "moov" || type === "trak" || type === "mdia" || type === "edts") {
         walk(offset + 8, boxEnd);
@@ -315,76 +327,70 @@ function patchMp4Metadata(arrayBuffer, date, durationSeconds) {
   return arrayBuffer;
 }
 
-/* ---------- 断片（moof+mdat）のタイムスタンプを、このパーツの先頭=0秒に補正する ----------
-   mp4box.js が出力する moof 内の tfdt（baseMediaDecodeTime）は、元動画全体の中での
-   絶対位置のままになっている（パーツごとにリセットされない）。そのため、例えば
-   「元動画の7分00秒〜7分28秒」のパーツは、実際のデータは28秒分しかないのに、
-   コンテナ上は「0〜7分28秒の動画で、たまたま末尾28秒分だけデータがある」ように
-   見えてしまう。これが、日時のずれ・再生の途中停止・サムネイル生成失敗の原因になる。
-   このパーツに含まれる全moofのtfdtから、最初の値（＝このパーツの開始位置）を
-   引き、0始まりに補正する。映像・音声はタイムスケールが異なるため、それぞれの
-   バッファ（同一トラックのみを含む）ごとに個別に呼び出す。 */
-function rebaseFragmentTimestamps(buffer) {
-  const view = new DataView(buffer);
-  const end = buffer.byteLength;
-  const tfdtOffsets = [];
+/* ---------- 1パーツ分のサンプル列から、断片（moof+mdat）を自前で組み立てる ----------
+   mp4box.js 自身の断片化機能（setSegmentOptions/onSegment）は、内部的に必ず
+   「1コマ（1サンプル）＝1個のmoof+mdat」という単位で断片を作り、それを大量に
+   連結する仕組みになっている（60秒の動画で1000個以上）。これは仕様上は正しい
+   fMP4だが、実際に試したところiPhoneの写真アプリ側がこの特殊な構造とうまく
+   噛み合わず、動画の長さ表示や再生が壊れる問題が起きた。
+   そこで、mp4box.jsからは setExtractionOptions/onSamples で生のサンプル列
+   （実データ・長さ・タイムスタンプ情報）だけを受け取り、パーツ1個分のサンプルを
+   すべてまとめて「1個のmoof＋1個のmdat」として自前で書き出す。一般的な動画
+   ファイルに近い、まとまった大きさの断片になる。
+   箱の並び（tfhd/tfdt/trunの各フィールド）は、mp4box.js自身が1サンプルずつの
+   断片を作る際の書き出し方（createSingleSampleMoof）と同じ形式に合わせている。 */
+function buildMoofMdat(trackId, samples, sequenceNumber) {
+  const sampleCount = samples.length;
+  let mdatDataSize = 0;
+  for (const s of samples) mdatDataSize += s.size;
 
-  function readType(offset) {
-    return String.fromCharCode(
-      view.getUint8(offset + 4), view.getUint8(offset + 5),
-      view.getUint8(offset + 6), view.getUint8(offset + 7)
-    );
-  }
+  const trunContentSize = 8 + 16 * sampleCount; // sample_count(4)+data_offset(4) + (duration+size+flags+cts)*4byte各
+  const trunBoxSize = 12 + trunContentSize; // FullBoxヘッダ(size4+type4+version1+flags3)
+  const tfhdBoxSize = 12 + 4; // track_idのみ
+  const tfdtBoxSize = 12 + 4; // version0のbaseMediaDecodeTime（常に0）
+  const trafBoxSize = 8 + tfhdBoxSize + tfdtBoxSize + trunBoxSize; // 単純なコンテナ箱（ヘッダ8byte）
+  const mfhdBoxSize = 12 + 4;
+  const moofBoxSize = 8 + mfhdBoxSize + trafBoxSize;
+  const mdatBoxSize = 8 + mdatDataSize;
+  const dataOffset = moofBoxSize + 8; // moof全体＋mdatヘッダの直後からサンプル実データが始まる
 
-  let offset = 0;
-  while (offset + 8 <= end) {
-    const size = view.getUint32(offset, false);
-    const type = readType(offset);
-    if (size < 8) break;
-    if (type === "moof") {
-      let coff = offset + 8;
-      const cend = offset + size;
-      while (coff + 8 <= cend) {
-        const csize = view.getUint32(coff, false);
-        const ctype = readType(coff);
-        if (csize < 8) break;
-        if (ctype === "traf") {
-          let toff = coff + 8;
-          const tend = coff + csize;
-          while (toff + 8 <= tend) {
-            const tsize = view.getUint32(toff, false);
-            const ttype = readType(toff);
-            if (ttype === "tfdt") tfdtOffsets.push(toff);
-            if (tsize < 8) break;
-            toff += tsize;
-          }
-        }
-        coff += csize;
-      }
-    }
-    offset += size;
-  }
+  const out = new ArrayBuffer(moofBoxSize + mdatBoxSize);
+  const view = new DataView(out);
+  const bytes = new Uint8Array(out);
+  let pos = 0;
 
-  if (tfdtOffsets.length === 0) return;
+  function u8(v) { view.setUint8(pos, v); pos += 1; }
+  function u32(v) { view.setUint32(pos, v, false); pos += 4; }
+  function i32(v) { view.setInt32(pos, v, false); pos += 4; }
+  function boxType(t) { for (let i = 0; i < 4; i++) u8(t.charCodeAt(i)); }
+  function plainHeader(size, type) { u32(size); boxType(type); }
+  function fullHeader(size, type, flags) { u32(size); boxType(type); u8(0); u8((flags >> 16) & 0xff); u8((flags >> 8) & 0xff); u8(flags & 0xff); }
 
-  function readTfdt(off) {
-    const version = view.getUint8(off + 8);
-    return version === 1 ? view.getBigUint64(off + 12, false) : BigInt(view.getUint32(off + 12, false));
-  }
-  function writeTfdt(off, value) {
-    const version = view.getUint8(off + 8);
-    if (version === 1) view.setBigUint64(off + 12, value, false);
-    else view.setUint32(off + 12, Number(value), false);
+  plainHeader(moofBoxSize, "moof");
+  fullHeader(mfhdBoxSize, "mfhd", 0);
+  u32(sequenceNumber);
+  plainHeader(trafBoxSize, "traf");
+  fullHeader(tfhdBoxSize, "tfhd", 0x020000); // default-base-is-moof
+  u32(trackId);
+  fullHeader(tfdtBoxSize, "tfdt", 0);
+  u32(0); // このパーツの先頭を0秒とする
+  fullHeader(trunBoxSize, "trun", 0x01 | 0x100 | 0x200 | 0x400 | 0x800); // data-offset+duration+size+flags+cts-offset
+  u32(sampleCount);
+  i32(dataOffset);
+  for (const s of samples) {
+    u32(s.duration);
+    u32(s.size);
+    u32(s.is_sync ? (1 << 25) : (1 << 16));
+    u32(s.cts - s.dts);
   }
 
-  let base = null;
-  for (const off of tfdtOffsets) {
-    const v = readTfdt(off);
-    if (base === null || v < base) base = v;
+  plainHeader(mdatBoxSize, "mdat");
+  for (const s of samples) {
+    bytes.set(s.data, pos);
+    pos += s.size;
   }
-  for (const off of tfdtOffsets) {
-    writeTfdt(off, readTfdt(off) - base);
-  }
+
+  return out;
 }
 
 /* ---------- ステップ2→3→4：分割開始 ---------- */
@@ -482,19 +488,6 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
       if (!parts.video) return;
       if (needAudio && !parts.audio) return;
 
-      // mp4box.jsは各断片の tfdt（このパーツの先頭が元動画全体の中で何秒目に
-      // あたるか）を、パーツ単位でリセットせず元動画全体での絶対位置のまま
-      // 出力する。そのままだと、パーツ自身は数十秒しか実データが無いのに、
-      // コンテナ上は「元動画全体と同じ長さで、たまたま途中だけデータがある
-      // ファイル」に見えてしまい、日時のズレ・再生の途中停止・サムネイル
-      // 生成失敗の原因になる。このパーツの先頭を0秒とみなすよう補正する。
-      try {
-        rebaseFragmentTimestamps(parts.video);
-        if (parts.audio) rebaseFragmentTimestamps(parts.audio);
-      } catch (e) {
-        log(`タイムスタンプの補正に失敗（${segIndex + 1}番目）: ${e.message}`);
-      }
-
       const buffers = [initBuffer, parts.video];
       if (needAudio) buffers.push(parts.audio);
       const arrayBuffer = concatArrayBuffers(buffers);
@@ -574,12 +567,16 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
 
         log(`duration=${totalDuration.toFixed(1)}s videoFps=${videoFps.toFixed(2)} nbSamplesPerSeg=${nbSamplesPerSeg} segCount=${segCount}`);
 
-        mp4boxfile.setSegmentOptions(videoTrackId, "video", { nbSamples: nbSamplesPerSeg, rapAlignement: true });
+        // setSegmentOptions()自体はダミー値でよい（onSegmentは使わないため）。
+        // initializeSegmentation()が初期化セグメント（moov）を返すために、
+        // 各トラックが「登録済み」である必要があるだけ。
+        mp4boxfile.setSegmentOptions(videoTrackId, "video", {});
+        let audioNbSamples = 0;
         if (audioTrackId) {
           const audioTrack = info.tracks.find((t) => t.id === audioTrackId);
           const audioRate = audioTrack.nb_samples / totalDuration;
-          const audioNbSamples = Math.max(1, Math.round(audioRate * effectiveSeconds));
-          mp4boxfile.setSegmentOptions(audioTrackId, "audio", { nbSamples: audioNbSamples, rapAlignement: true });
+          audioNbSamples = Math.max(1, Math.round(audioRate * effectiveSeconds));
+          mp4boxfile.setSegmentOptions(audioTrackId, "audio", {});
         }
 
         // initializeSegmentation() はトラックごとに別々の初期化セグメント（moov）を返す
@@ -592,6 +589,17 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
           ? buildCombinedInitSegment(videoInitEntry.buffer, audioInitEntry.buffer)
           : videoInitEntry.buffer;
 
+        // mp4boxfile.onSegmentは設定しない（デフォルトのnull）ため、mp4box.js内部の
+        // 「1コマ＝1断片」というセグメント化処理は一切動かない。代わりに
+        // setExtractionOptions/onSamplesで生のサンプル列を取得し、パーツ1個分を
+        // まとめて1つの断片（moof+mdat）として自前で組み立てる（buildMoofMdat）。
+        // 通常の動画ファイルに近い、まとまった大きさの断片になり、iPhone側との
+        // 相性問題を避けられる。
+        mp4boxfile.setExtractionOptions(videoTrackId, "video", { nbSamples: nbSamplesPerSeg });
+        if (audioTrackId) {
+          mp4boxfile.setExtractionOptions(audioTrackId, "audio", { nbSamples: audioNbSamples });
+        }
+
         onPhase("切り出しています…");
         mp4boxfile.start();
       } catch (e) {
@@ -601,16 +609,22 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
 
     let segCounterVideo = 0;
     let segCounterAudio = 0;
+    let sampleCounterVideo = 0;
+    let sampleCounterAudio = 0;
+    let moofSequence = 1;
 
-    mp4boxfile.onSegment = (id, user, buffer, sampleNumber, last) => {
+    mp4boxfile.onSamples = (id, user, samples) => {
       const isVideo = id === videoTrackId;
       const idx = isVideo ? segCounterVideo++ : segCounterAudio++;
-      if (idx >= segmentPlan.length) return; // 想定外の余剰断片は無視
-      if (!pending.has(idx)) pending.set(idx, { video: null, audio: audioTrackId ? null : undefined });
-      const parts = pending.get(idx);
-      if (isVideo) parts.video = buffer; else parts.audio = buffer;
-      emitIfReady(idx);
-      mp4boxfile.releaseUsedSamples(id, sampleNumber);
+      if (isVideo) sampleCounterVideo += samples.length; else sampleCounterAudio += samples.length;
+      if (idx < segmentPlan.length) {
+        if (!pending.has(idx)) pending.set(idx, { video: null, audio: audioTrackId ? null : undefined });
+        const parts = pending.get(idx);
+        const buffer = buildMoofMdat(id, samples, moofSequence++);
+        if (isVideo) parts.video = buffer; else parts.audio = buffer;
+        emitIfReady(idx);
+      } // 想定外の余剰バッチは無視
+      mp4boxfile.releaseUsedSamples(id, isVideo ? sampleCounterVideo : sampleCounterAudio);
     };
 
     // ファイルを少しずつ読み込んで渡す
