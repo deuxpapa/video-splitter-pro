@@ -9,7 +9,7 @@
    ========================================================== */
 
 // 更新するたびに手動で書き換える（画面に表示され、更新が反映されたかの確認に使う）
-const APP_VERSION = "2026-09-16.5";
+const APP_VERSION = "2026-09-17.1";
 
 const TARGET_SEGMENT_SECONDS = 110; // 目安の区切り時間（実際の区切りはキーフレーム基準で多少前後する）
 const MIN_SEGMENT_SECONDS = 20; // これより短くはしない
@@ -875,8 +875,29 @@ async function saveSegment(seg, btn) {
   showToast(`${seg.index}番目を保存しました`, "success");
 }
 
-/* ---------- 結果表示 ---------- */
+/* ---------- 結果表示 ----------
+   プレビュー動画は、画面内に入ったものだけ読み込む（遅延読み込み）。
+   パーツ数が多い動画で、全プレビューを一度に読み込もうとすると、
+   iPhoneのSafariがデコーダーのリソース不足で一部のプレビューを
+   表示できなくなる（黒い画面＋斜線の三角マーク）ことがあったため。 */
+let previewObserver = null;
+
 function renderResults(segments) {
+  if (previewObserver) previewObserver.disconnect();
+  previewObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const video = entry.target;
+      if (entry.isIntersecting) {
+        if (!video.src) video.src = video.dataset.src;
+      } else if (video.src) {
+        // 画面外に出たら読み込みを解除し、デコーダーの負荷を減らす
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+      }
+    }
+  }, { rootMargin: "200px" });
+
   segmentList.innerHTML = "";
   resultHeading.textContent = `${segments.length}個に分割できました`;
   resultSingleNote.hidden = segments.length !== 1;
@@ -920,10 +941,12 @@ function renderResults(segments) {
 
     const preview = document.createElement("video");
     preview.className = "segment-item__preview";
-    preview.src = seg.url;
+    preview.dataset.src = seg.url;
+    preview.preload = "none";
     preview.controls = true;
     preview.playsInline = true;
     preview.setAttribute("aria-label", `${seg.index}番目のプレビュー`);
+    previewObserver.observe(preview);
 
     li.appendChild(row);
     li.appendChild(preview);
