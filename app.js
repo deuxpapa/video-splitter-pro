@@ -9,7 +9,7 @@
    ========================================================== */
 
 // 更新するたびに手動で書き換える（画面に表示され、更新が反映されたかの確認に使う）
-const APP_VERSION = "2026-09-17.1";
+const APP_VERSION = "2026-09-17.2";
 
 const TARGET_SEGMENT_SECONDS = 110; // 目安の区切り時間（実際の区切りはキーフレーム基準で多少前後する）
 const MIN_SEGMENT_SECONDS = 20; // これより短くはしない
@@ -19,6 +19,11 @@ const CHUNK_BYTES = 8 * 1024 * 1024; // ファイルを読み込む1回あたり
 // 起きにくいはずだが、実績がまだ無いため、念のため大きめの安全側の目安値だけ残しておく。
 const SIZE_WARN_BYTES = 3 * 1024 * 1024 * 1024; // 3GB
 const MP4BOX_URL = "https://cdn.jsdelivr.net/npm/mp4box@0.5.3/dist/mp4box.all.min.js";
+// 未保存のまま同時にメモリへ残せるパーツの合計サイズの上限。長い動画で
+// 「全パーツ完成を待ってから結果画面へ」という作りだと、未保存データが
+// 動画の長さに比例して積み上がり、実機でアプリごとクラッシュすることが
+// あったため、この上限に達したら保存されるまで後続パーツの作成を一時停止する。
+const UNSAVED_BYTES_LIMIT = 500 * 1024 * 1024; // 500MB
 
 const screens = {
   select: document.getElementById("screen-select"),
@@ -42,6 +47,7 @@ const resultHeading = document.getElementById("result-heading");
 const resultElapsedEl = document.getElementById("result-elapsed");
 const resultSourceDateEl = document.getElementById("result-source-date");
 const resultSingleNote = document.getElementById("result-single-note");
+const resultProgressNote = document.getElementById("result-progress-note");
 const segmentList = document.getElementById("segment-list");
 const toastEl = document.getElementById("toast");
 const errorDetailEl = document.getElementById("error-detail");
@@ -188,6 +194,15 @@ function resetToSelect() {
   clearErrorDetail();
   showScreen("select");
   releaseWakeLock();
+
+  // 分割処理が裏でまだ進んでいる場合（結果画面の途中で「やり直す」を押した
+  // 場合など）は、そちらを停止させる。停止に気づけるよう、一時停止中の
+  // 処理があれば起こしておく。
+  activeRunToken = null;
+  const waiters = capacityWaiters;
+  capacityWaiters = [];
+  unsavedBytesTotal = 0;
+  waiters.forEach((resolve) => resolve());
 }
 
 /* ---------- 外部スクリプトの読み込み（動画解析エンジン本体） ---------- */
@@ -511,10 +526,39 @@ function patchStco(trakBuffer, dataOffset) {
 }
 
 /* ---------- ステップ2→3→4：分割開始 ---------- */
+// 未保存のまま溜まっているパーツの合計サイズと、それを見ている処理の
+// 一時停止・再開の仕組み。btnStartのクリックのたびにリセットする。
+let unsavedBytesTotal = 0;
+let capacityWaiters = [];
+// 現在進行中の分割処理を指す目印。「やり直す」で処理を放棄したときに、
+// 裏に残った古い処理のコールバックが新しい処理の画面を書き換えたり、
+// 未保存合計を共有して誤動作させたりしないようにする。
+let activeRunToken = null;
+
+function waitForCapacity(onWaiting) {
+  if (unsavedBytesTotal < UNSAVED_BYTES_LIMIT) return Promise.resolve();
+  if (onWaiting) onWaiting();
+  return new Promise((resolve) => { capacityWaiters.push(resolve); });
+}
+
+function releaseCapacity(bytes) {
+  unsavedBytesTotal = Math.max(0, unsavedBytesTotal - bytes);
+  if (unsavedBytesTotal < UNSAVED_BYTES_LIMIT && capacityWaiters.length) {
+    const resolvers = capacityWaiters;
+    capacityWaiters = [];
+    resolvers.forEach((resolve) => resolve());
+  }
+}
+
 btnStart.addEventListener("click", async () => {
   if (!currentFile) return;
   clearErrorDetail();
   procLog = [];
+  unsavedBytesTotal = 0;
+  capacityWaiters = [];
+  const runToken = {};
+  activeRunToken = runToken;
+  const isActive = () => activeRunToken === runToken;
 
   showScreen("processing");
   progressLabel.textContent = "準備しています…";
@@ -523,6 +567,9 @@ btnStart.addEventListener("click", async () => {
   await requestWakeLock();
 
   const baseName = getBaseName(currentFile.name);
+  let resultsScreenShown = false;
+  let lastDoneCount = 0;
+  let lastTotalCount = null;
 
   try {
     progressLabel.textContent = "動画解析エンジンを準備しています…";
@@ -532,35 +579,56 @@ btnStart.addEventListener("click", async () => {
     // メタデータを書き換えてBlob化するため、先に計算しておく。
     const fileLastModifiedDate = currentFile.lastModified ? new Date(currentFile.lastModified) : null;
 
+    // パーツができ次第すぐに結果画面へ切り替え、その場に追加していく。
+    // 全パーツの完成を待たないため、長い動画でも未保存データが
+    // 溜まり続けることがない（一定量を超えたら waitForCapacity で一時停止する）。
+    function onSegmentReady(seg, doneCount, totalCount) {
+      if (!isActive()) return;
+      unsavedBytesTotal += seg.sizeBytes;
+      lastDoneCount = doneCount;
+      lastTotalCount = totalCount;
+      if (!resultsScreenShown) {
+        resultsScreenShown = true;
+        initResultsScreen(fileLastModifiedDate);
+        showScreen("result");
+      }
+      appendResultItem(seg);
+      updateProgressNote(doneCount, totalCount, false);
+    }
+
     const finalSegments = await splitVideo(currentFile, {
       baseName,
       fileLastModifiedDate,
-      onPhase: (text) => { progressLabel.textContent = text; },
-      onProgress: (ratio) => updateProgress(ratio),
+      onPhase: (text) => { if (isActive() && !resultsScreenShown) progressLabel.textContent = text; },
+      onProgress: (ratio) => { if (isActive() && !resultsScreenShown) updateProgress(ratio); },
+      onSegmentReady,
+      waitForCapacity: () => waitForCapacity(() => {
+        if (isActive()) updateProgressNote(lastDoneCount, lastTotalCount, true);
+      }),
+      isCancelled: () => !isActive(),
     });
+
+    if (!isActive()) return; // 途中で「やり直す」が押され、別の動画に切り替わっている
 
     if (finalSegments.length === 0) {
       throw new Error("分割結果を読み取れませんでした。");
     }
 
-    renderResults(finalSegments);
-    resultElapsedEl.textContent = `処理時間 ${formatDuration((Date.now() - elapsedStartMs) / 1000)}`;
-    if (fileLastModifiedDate) {
-      resultSourceDateEl.innerHTML =
-        `元動画の撮影日時：${fileLastModifiedDate.toLocaleString("ja-JP")}<br>元動画の日時に更新しています。`;
-    } else {
-      resultSourceDateEl.textContent = "";
-    }
-    showScreen("result");
+    finalizeResultsScreen(finalSegments.length);
     showToast("分割が完了しました", "success");
   } catch (err) {
+    if (!isActive()) return; // 放棄された処理のエラーは無視する
     console.error(err);
     showErrorToast("動画を短くするか、他のアプリを閉じてからもう一度お試しください。");
     showErrorDetail(err);
-    showScreen("ready");
+    // すでにいくつかパーツが結果画面に出ている場合は、そのまま見て保存を
+    // 続けられるように、最初の画面へは戻さない。
+    if (!resultsScreenShown) showScreen("ready");
   } finally {
-    stopElapsedTimer();
-    releaseWakeLock();
+    if (isActive()) {
+      stopElapsedTimer();
+      releaseWakeLock();
+    }
   }
 });
 
@@ -570,7 +638,7 @@ btnStart.addEventListener("click", async () => {
    その秒数に相当するサンプル数を逆算して渡す）ごとにストリームコピーで切り出す。
    各パーツは、断片化（fMP4）ではなく、通常のカメラ動画と同じ古典的な構造
    （moovに直接サンプル位置の表がある）で組み立てる。 */
-function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress }) {
+function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress, onSegmentReady, waitForCapacity, isCancelled }) {
   return new Promise((resolve, reject) => {
     const mp4boxfile = MP4Box.createFile();
     let videoTrackId = null;
@@ -667,7 +735,7 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
 
       const sizeBytes = arrayBuffer.byteLength;
       const blob = new Blob([arrayBuffer], { type: "video/mp4" });
-      finished.push({
+      const item = {
         index: segIndex1,
         start: plan.startSec,
         end: plan.endSec,
@@ -675,10 +743,12 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
         blob,
         filename: `${baseName}_${String(segIndex1).padStart(2, "0")}.mp4`,
         sizeBytes,
-      });
+      };
+      finished.push(item);
 
       onProgress(segIndex1 / segmentPlan.length);
       onPhase(`切り出しています…（${segIndex1}/${segmentPlan.length}個目）`);
+      onSegmentReady(item, segIndex1, segmentPlan.length);
       finishIfDone();
     }
 
@@ -770,10 +840,17 @@ function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onProgress 
         templateMvhdBytes = extracted.mvhdBytes;
         trackTemplates = extracted.templates;
 
-        // ファイルを少しずつ読み込んで渡す
+        // ファイルを少しずつ読み込んで渡す。未保存のパーツが一定量を超えたら、
+        // 保存されて減るまでここで一時停止する（先読みしすぎない）。
+        // 「やり直す」で処理そのものが放棄された場合は、ここで読み込みをやめる
+        // （そのまま裏で走らせ続けると、未保存合計を新しい処理と共有して
+        // 誤動作させたり、無駄にメモリ・電力を使い続けたりする）。
         let offset = 0;
         const total = file.size;
         while (offset < total) {
+          if (isCancelled()) return;
+          await waitForCapacity();
+          if (isCancelled()) return;
           const end = Math.min(offset + CHUNK_BYTES, total);
           const chunk = await file.slice(offset, end).arrayBuffer();
           chunk.fileStart = offset;
@@ -835,6 +912,7 @@ function boxHeader(size, type) {
 function markSaved(btn) {
   btn.textContent = "保存済み ✓";
   btn.dataset.saved = "true";
+  btn.disabled = true;
 }
 
 function fallbackDownload(seg) {
@@ -844,6 +922,24 @@ function fallbackDownload(seg) {
   document.body.appendChild(a);
   a.click();
   a.remove();
+}
+
+// 保存が終わったパーツは、未保存の合計サイズから差し引き（一時停止していれば
+// 再開のきっかけになる）、プレビュー動画を画面から消してメモリを解放する。
+function finalizeSavedSegment(seg) {
+  if (seg.released) return;
+  seg.released = true;
+  releaseCapacity(seg.sizeBytes);
+  if (seg.previewEl) {
+    seg.previewEl.pause();
+    seg.previewEl.removeAttribute("src");
+    seg.previewEl.load();
+    if (previewObserver) previewObserver.unobserve(seg.previewEl);
+    seg.previewEl.remove();
+    seg.previewEl = null;
+  }
+  URL.revokeObjectURL(seg.url);
+  seg.blob = null;
 }
 
 async function saveSegment(seg, btn) {
@@ -862,6 +958,7 @@ async function saveSegment(seg, btn) {
       await navigator.share({ files: [file] });
       markSaved(btn);
       showToast(`${seg.index}番目を保存しました`, "success");
+      finalizeSavedSegment(seg);
     } catch (err) {
       if (err && err.name === "AbortError") return;
       console.error(err);
@@ -873,22 +970,24 @@ async function saveSegment(seg, btn) {
   fallbackDownload(seg);
   markSaved(btn);
   showToast(`${seg.index}番目を保存しました`, "success");
+  finalizeSavedSegment(seg);
 }
 
 /* ---------- 結果表示 ----------
+   パーツができ次第すぐ一覧に追加する（全パーツの完成を待たない）。
    プレビュー動画は、画面内に入ったものだけ読み込む（遅延読み込み）。
    パーツ数が多い動画で、全プレビューを一度に読み込もうとすると、
    iPhoneのSafariがデコーダーのリソース不足で一部のプレビューを
    表示できなくなる（黒い画面＋斜線の三角マーク）ことがあったため。 */
 let previewObserver = null;
 
-function renderResults(segments) {
+function initResultsScreen(fileLastModifiedDate) {
   if (previewObserver) previewObserver.disconnect();
   previewObserver = new IntersectionObserver((entries) => {
     for (const entry of entries) {
       const video = entry.target;
       if (entry.isIntersecting) {
-        if (!video.src) video.src = video.dataset.src;
+        if (!video.src && video.dataset.src) video.src = video.dataset.src;
       } else if (video.src) {
         // 画面外に出たら読み込みを解除し、デコーダーの負荷を減らす
         video.pause();
@@ -899,59 +998,82 @@ function renderResults(segments) {
   }, { rootMargin: "200px" });
 
   segmentList.innerHTML = "";
-  resultHeading.textContent = `${segments.length}個に分割できました`;
-  resultSingleNote.hidden = segments.length !== 1;
-
-  for (const seg of segments) {
-    const li = document.createElement("li");
-    li.className = "segment-item";
-
-    const row = document.createElement("div");
-    row.className = "segment-item__row";
-
-    const badge = document.createElement("div");
-    badge.className = "segment-item__badge";
-    badge.textContent = String(seg.index);
-    badge.setAttribute("aria-hidden", "true");
-
-    const info = document.createElement("div");
-    info.className = "segment-item__info";
-
-    const range = document.createElement("p");
-    range.className = "segment-item__range";
-    range.textContent = `元動画の ${formatTime(seg.start)}〜${formatTime(seg.end)}`;
-
-    const dur = document.createElement("p");
-    dur.className = "segment-item__dur";
-    dur.textContent = `長さ ${formatTime(seg.end - seg.start)}・${formatBytes(seg.sizeBytes)}`;
-
-    info.appendChild(range);
-    info.appendChild(dur);
-
-    const saveBtn = document.createElement("button");
-    saveBtn.type = "button";
-    saveBtn.className = "segment-item__save";
-    saveBtn.textContent = "保存する";
-    saveBtn.setAttribute("aria-label", `${seg.index}番目（元動画の${formatTime(seg.start)}から${formatTime(seg.end)}）を保存する`);
-    saveBtn.addEventListener("click", () => saveSegment(seg, saveBtn));
-
-    row.appendChild(badge);
-    row.appendChild(info);
-    row.appendChild(saveBtn);
-
-    const preview = document.createElement("video");
-    preview.className = "segment-item__preview";
-    preview.dataset.src = seg.url;
-    preview.preload = "none";
-    preview.controls = true;
-    preview.playsInline = true;
-    preview.setAttribute("aria-label", `${seg.index}番目のプレビュー`);
-    previewObserver.observe(preview);
-
-    li.appendChild(row);
-    li.appendChild(preview);
-    segmentList.appendChild(li);
+  resultHeading.textContent = "分割しています…";
+  resultElapsedEl.textContent = "";
+  resultSingleNote.hidden = true;
+  resultProgressNote.hidden = true;
+  if (fileLastModifiedDate) {
+    resultSourceDateEl.innerHTML =
+      `元動画の撮影日時：${fileLastModifiedDate.toLocaleString("ja-JP")}<br>元動画の日時に更新しています。`;
+  } else {
+    resultSourceDateEl.textContent = "";
   }
+}
+
+function updateProgressNote(doneCount, totalCount, paused) {
+  resultProgressNote.hidden = false;
+  resultProgressNote.textContent = paused
+    ? `${totalCount}個中${doneCount}個まで完成・保存すると続きを作成します`
+    : `${totalCount}個中${doneCount}個まで完成・作成中…`;
+}
+
+function finalizeResultsScreen(totalCount) {
+  resultHeading.textContent = `${totalCount}個に分割できました`;
+  resultElapsedEl.textContent = `処理時間 ${formatDuration((Date.now() - elapsedStartMs) / 1000)}`;
+  resultSingleNote.hidden = totalCount !== 1;
+  resultProgressNote.hidden = true;
+}
+
+function appendResultItem(seg) {
+  const li = document.createElement("li");
+  li.className = "segment-item";
+
+  const row = document.createElement("div");
+  row.className = "segment-item__row";
+
+  const badge = document.createElement("div");
+  badge.className = "segment-item__badge";
+  badge.textContent = String(seg.index);
+  badge.setAttribute("aria-hidden", "true");
+
+  const info = document.createElement("div");
+  info.className = "segment-item__info";
+
+  const range = document.createElement("p");
+  range.className = "segment-item__range";
+  range.textContent = `元動画の ${formatTime(seg.start)}〜${formatTime(seg.end)}`;
+
+  const dur = document.createElement("p");
+  dur.className = "segment-item__dur";
+  dur.textContent = `長さ ${formatTime(seg.end - seg.start)}・${formatBytes(seg.sizeBytes)}`;
+
+  info.appendChild(range);
+  info.appendChild(dur);
+
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.className = "segment-item__save";
+  saveBtn.textContent = "保存する";
+  saveBtn.setAttribute("aria-label", `${seg.index}番目（元動画の${formatTime(seg.start)}から${formatTime(seg.end)}）を保存する`);
+  saveBtn.addEventListener("click", () => saveSegment(seg, saveBtn));
+
+  row.appendChild(badge);
+  row.appendChild(info);
+  row.appendChild(saveBtn);
+
+  const preview = document.createElement("video");
+  preview.className = "segment-item__preview";
+  preview.dataset.src = seg.url;
+  preview.preload = "none";
+  preview.controls = true;
+  preview.playsInline = true;
+  preview.setAttribute("aria-label", `${seg.index}番目のプレビュー`);
+  previewObserver.observe(preview);
+  seg.previewEl = preview;
+
+  li.appendChild(row);
+  li.appendChild(preview);
+  segmentList.appendChild(li);
 }
 
 /* ---------- 想定外のクラッシュも必ず日本語で伝える ---------- */
