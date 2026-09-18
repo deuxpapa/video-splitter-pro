@@ -9,7 +9,7 @@
    ========================================================== */
 
 // 更新するたびに手動で書き換える（画面に表示され、更新が反映されたかの確認に使う）
-const APP_VERSION = "2026-09-17.3";
+const APP_VERSION = "2026-09-18.1";
 
 const TARGET_SEGMENT_SECONDS = 110; // 目安の区切り時間（実際の区切りはキーフレーム基準で多少前後する）
 const MIN_SEGMENT_SECONDS = 20; // これより短くはしない
@@ -818,24 +818,43 @@ async function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onPro
   // 映像トラックのサンプルを、目標秒数ごとの範囲に分ける
   const videoFps = videoTemplate.samples.length / totalDuration;
   const nbSamplesPerSeg = Math.max(1, Math.round(videoFps * effectiveSeconds));
-  const audioNbSamplesPerSeg = audioTemplate
-    ? Math.max(1, Math.round((audioTemplate.samples.length / totalDuration) * effectiveSeconds))
-    : 0;
 
   let segCount = Math.max(1, Math.ceil(totalDuration / effectiveSeconds));
   if (segCount > 1) {
     const tailSec = totalDuration - (segCount - 1) * effectiveSeconds;
     if (tailSec <= MIN_TAIL_SECONDS + 1) segCount -= 1;
   }
+
+  // 各パーツの映像側の開始位置を、次の同期サンプル（キーフレーム）に揃える。
+  // キーフレームでない位置から始まる映像は、その場面を再生するための
+  // 参照フレームが無いため、正しく再生できない（音声だけ進んで映像が
+  // 止まって見える）。1個目は常にサンプル0（＝必ずキーフレーム）から始まる。
+  const videoBoundaries = [0];
+  for (let i = 1; i < segCount; i++) {
+    let idx = i * nbSamplesPerSeg;
+    while (idx < videoTemplate.samples.length && !videoTemplate.samples[idx].is_sync) idx++;
+    videoBoundaries.push(Math.min(idx, videoTemplate.samples.length));
+  }
+  videoBoundaries.push(videoTemplate.samples.length);
+
+  function timeAtVideoBoundary(i) {
+    return i < videoTemplate.samples.length
+      ? videoTemplate.samples[i].dts / videoTemplate.mediaTimescale
+      : totalDuration;
+  }
+
   const segmentPlan = [];
   for (let i = 0; i < segCount; i++) {
-    const startSec = i * effectiveSeconds;
-    const endSec = i === segCount - 1 ? totalDuration : startSec + effectiveSeconds;
-    segmentPlan.push({ startSec, endSec });
+    segmentPlan.push({ startSec: timeAtVideoBoundary(videoBoundaries[i]), endSec: timeAtVideoBoundary(videoBoundaries[i + 1]) });
   }
 
   log(`duration=${totalDuration.toFixed(1)}s videoFps=${videoFps.toFixed(2)} nbSamplesPerSeg=${nbSamplesPerSeg} segCount=${segCount}`);
   onPhase("切り出しています…");
+
+  // 音声側は、対応する映像パーツが実際にキーフレームへ揃えられた後の
+  // 時刻範囲に合わせて境界を決める（独立に区切ると映像とずれるため）。
+  let audioCursor = 0;
+  let prevAudioEnd = 0;
 
   const finished = [];
   for (let segIndex = 0; segIndex < segCount; segIndex++) {
@@ -846,14 +865,22 @@ async function splitVideo(file, { baseName, fileLastModifiedDate, onPhase, onPro
     const plan = segmentPlan[segIndex];
     const isLast = segIndex === segCount - 1;
 
-    const videoStart = segIndex * nbSamplesPerSeg;
-    const videoEnd = isLast ? videoTemplate.samples.length : Math.min(videoStart + nbSamplesPerSeg, videoTemplate.samples.length);
+    const videoStart = videoBoundaries[segIndex];
+    const videoEnd = videoBoundaries[segIndex + 1];
     const videoSamples = await readSampleData(file, videoTemplate.samples.slice(videoStart, videoEnd));
 
     let audioSamples = null;
     if (audioTemplate) {
-      const audioStart = segIndex * audioNbSamplesPerSeg;
-      const audioEnd = isLast ? audioTemplate.samples.length : Math.min(audioStart + audioNbSamplesPerSeg, audioTemplate.samples.length);
+      const audioStart = prevAudioEnd;
+      let audioEnd;
+      if (isLast) {
+        audioEnd = audioTemplate.samples.length;
+      } else {
+        const targetDts = plan.endSec * audioTemplate.mediaTimescale;
+        while (audioCursor < audioTemplate.samples.length && audioTemplate.samples[audioCursor].dts < targetDts) audioCursor++;
+        audioEnd = audioCursor;
+      }
+      prevAudioEnd = audioEnd;
       audioSamples = await readSampleData(file, audioTemplate.samples.slice(audioStart, audioEnd));
     }
 
